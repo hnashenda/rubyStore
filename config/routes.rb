@@ -10,11 +10,19 @@ Rails.application.routes.draw do
     delete 'signout', to: 'org_people/sessions#destroy'
   end
 
+
+  post 'carts/add/' => 'carts#add', :to => 'carts_add'
+
+  get 'org_companies/:id/company_profile' => 'org_companies#company_profile', :as => 'org_companies_company_profile'
   get 'org_companies/people/' => 'org_companies#people', :to => "org_companies_people"
   
+
   post 'org_people/edit_position/' => 'org_people#edit_position', :to => "org_people_edit_position"
   post 'org_people/remove_from_company/' => 'org_people#remove_from_company', :to => "org_people_remove_from_company"
 
+  post 'org_products/vote_product/' => 'org_products#vote_product', :to => "org_products_vote_product"
+
+  post 'trx_orders/stripe/' => 'trx_orders#stripe', :to =>"trx_orders_stripe"
   # The priority is based upon order of creation: first created -> highest priority.
   # See how all your routes lay out with "rake routes".
 
@@ -42,9 +50,12 @@ Rails.application.routes.draw do
   #     end
   #   end
 
+  resources :carts
   resources :catalogues
   resources :org_people
   resources :org_companies
+  resources :org_products
+  resources :trx_orders
   root "catalogues#index"
 
   match '/org_register', to:'org_companies#new', via: 'get'
