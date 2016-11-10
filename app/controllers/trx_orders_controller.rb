@@ -30,8 +30,193 @@ class TrxOrdersController < ApplicationController
 		@currency = Money.new(1, session[:currency]["iso_code"]).currency # Gives us the currency symbol to display in the view
 	end
 
+	def stripe
+		billing = {
+			name: params["stripeBillingName"],
+			address: {
+				line1: params["stripeBillingAddressLine1"],
+				postal_code: params["stripeBillingAddressZip"],
+				city: params["stripeBillingAddressCity"],
+				region: params["stripeBillingAddressState"],
+				country: params["stripeBillingAddressCountryCode"],
+			}	
+		}
+
+		shipping = {
+			name: params["stripeShippingName"],
+			address: {
+				line1: params["stripeShippingAddressLine1"],
+				postal_code: params["stripeShippingAddressZip"],
+				city: params["stripeShippingAddressCity"],
+				state: params["stripeShippingAddressState"],
+				country: params["stripeShippingAddressCountryCode"],
+			}
+		}
+
+		Stripe.api_key = ENV['STRIPE_SECRET_KEY']
+
+		@customer = Stripe::Customer.create(
+			:email => params[:stripeEmail]
+			:source => params[:stripeToken]
+		)
+		stripeTransactions = Array.new # Array used so later we can update the StripeTransactions with their TrxOrder id
+		amount_total = 0 # Keep track of the total
+		session[:svc].each do |key, array|
+			token = Stripe::Token.create({:customer => @customer.id}, {:stripe_account => array['stripe_id']})
+
+			# Charge the customer instead of the card
+			charge = Stripe::Charge.create(
+				{  	:source 	=> token.id,
+					:amount 	=> (array['total']*100).to_i,
+					:description => 'Cart Purchase',
+					:currency	=> session[:currency]['iso_code'],
+					:shipping 	=> shipping,
+					:application_fee => (array['fee']*100).to_i
+				}, {:stripe_account => array['stripe_id']}
+			)
+
+			# If the charge succeeded, then record the data
+			if charge[:paid]
+				stripeCharge = {
+					txn_type: charge[:object],
+					currency: charge[:currency],
+					total_amount: charge[:amount],
+					tax_amount: array['tax']*100.to_i,
+					notification_params: charge,
+					txn_id: charge[:id],
+					status: charge[:paid],
+					description: charge[:description] 
+				}
+				amount_total = amount_total + (array['total']*100).to_i # Keep track of the total
+				@sT = StripeTransaction.create(stripeCharge) # make a record in the StripeTransactions table
+				stripeTransactions << @sT.id # push the id into the stripeTransactions array for later use
+			end
+		end
+
+
+		if !stripeTransactions.empty? # If our stripeTransactions array is not empty, we made some transactions
+			@orderInfo = { # Gather the following information
+				org_company_id: current_org_person.org_company_id.nil? nil : current_org_person.org_company_id,
+				bill_to_contact_id: current_org_person.id,
+				purchased_at: Time.now,
+				total_amount: amount_total,
+				transport_method: session[:delivery_method]
+			}
+			@order = TrxOrder.create(@orderInfo)
+			StripeTransaction.where(id:stripeTransactions).update_all(trx_order_id: @order.id) #Update all the records of stripeTransactions with trx_order_id: @order.id
+			trx_order_fee = {
+				fee_amount: total_projectmeal_fee, #get the fees of all stripe_transcactions for this order
+				trx_order_id: @order.id
+			}
+			@trx_order_fee = TrxOrderFee.create(trx_order_fee)
+			@shipAddress = {
+				first_name:params["stripeShippingName"],
+				last_name:params["stripeShippingName"],
+				address1: params["stripeShippingAddressLine1"],
+				city: params["stripeShippingAddressCity"],
+				region: params["stripeShippingAddressState"],
+				postal_code: params["stripeShippingAddressZip"],
+				country: params["stripeShippingAddressCountryCode"],
+				email: params["stripeEmail"],
+				trx_order_id: @order.id
+			}
+			@shipInfo = ShippingAddress.find_or_craete_by!(@shipAddress)
+			@order.update(ship_to_contact_id: @shipInfo.id, trx_order_fee_id: @trx_order_fee.id) #Update the order with the new shipping address id
+		end
+
+		if !@shipInfo.nil?
+			product_sold(@order, @shipInfo)
+			session.delete(:svc) # Clean up sessions
+			redirect_to action: "stripe_success", id: @order.id
+		else
+			render :index
+		end
+		rescue Stripe::CardError => expiry_date
+			flash[:error] = e.message
+			redirect_to trx_order_path
+	end
+
+	# Grabs all the necessary data and presents an invoice display page after purchases
+	def stripe_success
+		@order = TrxOrder.find(params[:id])
+		@pm_fee = TrxOrderFee.find_by_id(@order.trx_order_fee_id)
+		# Only the purchaser can see this information
+		if current_org_person.id == @order.bill_to_contact_id || current_org_person.org_company_id == @order.org_company_id
+			@company = !@order.org_company_id.nil? ? OrgCompany.find(@order.org_company_id) : nil
+			@shipAddress = ShippingAddress.find_by(trx_order_id: params[:id])
+			@purchase_items = @order.TrxOrderItem.all
+			@notification_params_name = JSON.parse(@order.StripeTransaction.all[0][:notification_params])["card"]["name"]
+			@total_tax = @order.TrxOrderItem.sum(:tax_amount).to_f
+			@currency = Money.new(1, session[:currency]['iso_code']).currency # Gives us the currency symbol to display in the view
+			@contact = current_org_person
+			invoice_details_hash = { order: @order,
+				company: @company,
+				shipAddress: @shipAddress,
+				purchase_items: @purchase_items,
+				notification_params: @notification_params_name,
+				total_tax: @total_tax,
+				currency: @currency, 
+				billed_contact: @contact,
+				pm_fee: @pm_fee
+			}
+
+			Cart.destroy_all(org_person_id: current_org_person.id)
+			InvoiceMailer.invoice_details(invoice_details_hash).deliver
+			respond_to do |format|
+				format.html
+				format.pdf do 
+					render pdf: "Invoice ##{@order.id}",
+						template: "trx_orders/purchase_order.pdf.erb"
+				end
+			end
+		else
+			redirect_to root_path, flash: {warning: "You are not authorized to view this page."}
+		end
+	end
+
 
 	private
+	# Reduce the quantity for the specific items bought in the db and insert the bought items 
+	# into trx_order_items table with trx_order_id
+	def product_sold(order, sa)
+		@cart_item = Cart.where(org_person_id: current_org_person.id)  # Grab whatever is in the cart
+		array = Array.new  # Make a new array for holding ids
+		@cart_items.each do |id| # Throw all id's into the array
+			array << id[:org_product_id].to_i
+		end
+
+		@products = OrgProduct.where(id:array) # Find all the products with the id array
+		# For each product
+		@products.each_with_index do |product, index|
+
+			q = @cart_items.find{ |item| item.org_product_id == product.id}
+			#Update the quantity available in OrgProduct after the sale and save.
+			product.available_quantity = product.available_quantity.to_i - q.quantity
+			product.save
+			# Create the hash for insert into trx_order_items
+			order_item = {
+				name: product.name,
+				description: product.description,
+				weight_in_grams: product.weight_in_grams,
+				price: product.price,
+				available_quantity: product.available_quantity,
+				quantity: q.quantity,
+				expiry_date: product.expiry_date,
+				image: product.image,
+				delivery_status: 0,
+				org_product_id: product.id,
+				typ_category_id: product.typ_category_id,
+				typ_subcategory_id: product.typ_subcategory_id,
+				trx_order_id: order.id, 
+				org_company_id: product.org_company_id,
+				shipping_address_id: sa.id,
+				net_amount: (product.price * q.quantity), # We add fees and taxes on top of the price, so the net amount is always (price + tax + fees - tax - fees)
+				tax_amount: (product.price *  q.quantity)*(product.tax_amount/100) # Taxes paid
+			}
+			item = TrxOrderItem.find_or_initialize_by(trx_order_id: order.id, shipping_address_id: sa.id, org_product_id: product.id) #Create the item
+			item.update(order_item)
+		end
+	end
 
 	# Get subtotal, grabs the total of the cart and sanitizes the session variables
 	def get_subtotal(cart_array)
@@ -106,7 +291,7 @@ class TrxOrdersController < ApplicationController
 			# We need to find the COO, to get his stripe_user_id
 			person = OrgPerson.where(org_company_id: product.org_company_id, typ_position_id: 1).where.not(stripe_user_id: nil)
 			c = @cart_items.find{ |item| item.org_product_id == product.id } # This is to match the product to the cart item to get "c"
-			
+
 			if !person.empty?
 				c = @cart_items.find{ |item| item.org_product_id == product.id } # This is to match the product to the cart item to get "c"
 				subtotal = c.price * c.quantity # calculate subtotal
